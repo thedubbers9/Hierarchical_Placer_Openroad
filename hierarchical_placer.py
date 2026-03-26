@@ -46,6 +46,9 @@ DEFAULT_MAX_ASPECT_RATIO = 3.0
 
 ## Gap between macros (microns) – used as minimum spacing
 DEFAULT_MACRO_GAP = 10.0
+DEFAULT_ENABLE_SMALL_MACRO_HALO = True
+DEFAULT_MAX_SMALL_MACRO_HALO = 20.0
+DEFAULT_SMALL_MACRO_HALO_MEDIAN_FACTOR = 1.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -133,6 +136,9 @@ class HierarchicalPlacer:
         min_aspect_ratio: float = DEFAULT_MIN_ASPECT_RATIO,
         max_aspect_ratio: float = DEFAULT_MAX_ASPECT_RATIO,
         macro_gap: float = DEFAULT_MACRO_GAP,
+        enable_small_macro_halo: bool = DEFAULT_ENABLE_SMALL_MACRO_HALO,
+        max_small_macro_halo: float = DEFAULT_MAX_SMALL_MACRO_HALO,
+        small_macro_halo_median_factor: float = DEFAULT_SMALL_MACRO_HALO_MEDIAN_FACTOR,
         manufacturing_grid: float = 0.005,
     ):
         self.graph = graph
@@ -144,6 +150,9 @@ class HierarchicalPlacer:
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
         self.macro_gap = macro_gap
+        self.enable_small_macro_halo = enable_small_macro_halo
+        self.max_small_macro_halo = max_small_macro_halo
+        self.small_macro_halo_median_factor = small_macro_halo_median_factor
         self.manufacturing_grid = manufacturing_grid
 
         # Pre-compute node areas for fast lookup
@@ -164,6 +173,12 @@ class HierarchicalPlacer:
                 self._node_size[node] = self.macro_size_dict[macro_name]
             else:
                 self._node_size[node] = (0.0, 0.0)
+
+        nonzero_areas = sorted(a for a in self._node_area.values() if a > 0.0)
+        if nonzero_areas:
+            self._median_macro_area = nonzero_areas[len(nonzero_areas) // 2]
+        else:
+            self._median_macro_area = 0.0
 
     # ──────────────────────────────────────────────────────────
     #  Public API
@@ -268,11 +283,14 @@ class HierarchicalPlacer:
             # Trivial: center the single macro in the region
             node = nodes[0]
             w, h = self._node_size[node]
-            x = region.cx - w / 2.0
-            y = region.cy - h / 2.0
+            halo = self._small_macro_halo(node)
+            ew = w + 2.0 * halo
+            eh = h + 2.0 * halo
+            x = region.cx - ew / 2.0 + halo
+            y = region.cy - eh / 2.0 + halo
             # Clamp to region
-            x = max(region.x_min, min(x, region.x_max - w))
-            y = max(region.y_min, min(y, region.y_max - h))
+            x = max(region.x_min + halo, min(x, region.x_max - w - halo))
+            y = max(region.y_min + halo, min(y, region.y_max - h - halo))
             return {node: (x, y)}
 
         if len(nodes) <= self.N:
@@ -320,15 +338,18 @@ class HierarchicalPlacer:
                 slot_idx = perm[i]
                 sx, sy, sw, sh = slots[slot_idx]
                 nw, nh = self._node_size[node]
+                halo = self._small_macro_halo(node)
+                enw = nw + 2.0 * halo
+                enh = nh + 2.0 * halo
 
                 # Check that macro fits in slot
-                if nw > sw + 1e-6 or nh > sh + 1e-6:
+                if enw > sw + 1e-6 or enh > sh + 1e-6:
                     valid = False
                     break
 
-                # Center macro in slot
-                x = sx + (sw - nw) / 2.0
-                y = sy + (sh - nh) / 2.0
+                # Center effective macro box in slot, then offset to true macro LL.
+                x = sx + (sw - enw) / 2.0 + halo
+                y = sy + (sh - enh) / 2.0 + halo
                 candidate[node] = (x, y)
 
             if not valid:
@@ -395,7 +416,7 @@ class HierarchicalPlacer:
         # Compute total area per group
         group_areas = []
         for group in groups:
-            total = sum(self._node_area.get(n, 0) for n in group)
+            total = sum(self._node_effective_area(n) for n in group)
             group_areas.append(max(total, 1e-6))  # avoid zero
 
         # Allocate sub-regions using slicing: alternate horizontal/vertical cuts
@@ -637,17 +658,19 @@ class HierarchicalPlacer:
 
         for node in sorted_nodes:
             w, h = self._node_size[node]
+            halo = self._small_macro_halo(node)
+            ew = w + 2.0 * halo
 
             # Check if macro fits in current row
-            if x_cursor + w + self.macro_gap > region.x_max:
+            if x_cursor + ew + self.macro_gap > region.x_max:
                 # Move to next row
                 x_cursor = region.x_min + self.macro_gap
                 y_cursor += row_max_h + self.macro_gap
                 row_max_h = 0.0
 
-            positions[node] = (x_cursor, y_cursor)
-            x_cursor += w + self.macro_gap
-            row_max_h = max(row_max_h, h)
+            positions[node] = (x_cursor + halo, y_cursor + halo)
+            x_cursor += ew + self.macro_gap
+            row_max_h = max(row_max_h, h + 2.0 * halo)
 
         return positions
 
@@ -660,3 +683,26 @@ class HierarchicalPlacer:
         if self.manufacturing_grid <= 0:
             return value
         return round(value / self.manufacturing_grid) * self.manufacturing_grid
+
+    def _small_macro_halo(self, node: str) -> float:
+        """
+        Dynamic per-side halo around smaller macros.
+        Macros at/above median area get no extra halo.
+        """
+        if not self.enable_small_macro_halo:
+            return 0.0
+        area = self._node_area.get(node, 0.0)
+        if area <= 0.0 or self._median_macro_area <= 0.0:
+            return 0.0
+        threshold = self._median_macro_area * self.small_macro_halo_median_factor
+        if area >= threshold:
+            return 0.0
+        ratio = (threshold / area) - 1.0
+        halo = self.macro_gap * ratio
+        return max(0.0, min(halo, self.max_small_macro_halo))
+
+    def _node_effective_area(self, node: str) -> float:
+        """Area including dynamic halo, used for region allocation."""
+        w, h = self._node_size.get(node, (0.0, 0.0))
+        halo = self._small_macro_halo(node)
+        return (w + 2.0 * halo) * (h + 2.0 * halo)

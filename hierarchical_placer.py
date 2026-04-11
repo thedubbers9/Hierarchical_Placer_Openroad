@@ -2,8 +2,8 @@
 Hierarchical Macro Placer
 
 Implements a recursive placement algorithm for macro blocks:
-  - If the number of macros exceeds threshold N, use greedy connectivity-based
-    clustering to partition into D groups, then recurse on each group.
+  - If the number of macros exceeds threshold N, use connectivity- and area-aware
+    clustering to partition into exactly min(D, n) groups, then recurse on each group.
   - If the number of macros is <= N, enumerate all permutations of macros into
     D grid slots and pick the arrangement with minimum HPWL.
 
@@ -15,8 +15,6 @@ that can be sourced by OpenROAD in place of rtl_macro_placer.
 import logging
 import math
 import itertools
-import heapq
-import copy
 from typing import Dict, List, Tuple, Set, Optional
 
 import networkx as nx
@@ -37,8 +35,15 @@ def debug_print(msg):
 ## Recursion threshold: if #macros <= N, enumerate permutations
 DEFAULT_N = 4
 
-## Number of groups / slots for clustering and enumeration
+## Number of groups for each recursive partition (and preferred slot columns in enumeration)
 DEFAULT_D = 4
+## Scales the area-imbalance penalty in merge scoring: score = edge_count - weight * penalty.
+## Tuning: larger values favor more equal macro-area per cluster (avoid one huge cluster with
+## many tiny siblings); merges that overshoot the per-group area target are penalized more, so
+## connectivity can be sacrificed for balance. Smaller values favor preserving dense dataflow
+## (merge highly connected clusters even if areas become skewed); use toward 0 for
+## connectivity-dominated clustering.
+DEFAULT_CLUSTER_AREA_BALANCE_WEIGHT = 10.0
 
 ## Aspect ratio bounds for sub-regions (height / width)
 DEFAULT_MIN_ASPECT_RATIO = 0.33
@@ -48,7 +53,14 @@ DEFAULT_MAX_ASPECT_RATIO = 3.0
 DEFAULT_MACRO_GAP = 10.0
 DEFAULT_ENABLE_SMALL_MACRO_HALO = True
 DEFAULT_MAX_SMALL_MACRO_HALO = 20.0
-DEFAULT_SMALL_MACRO_HALO_MEDIAN_FACTOR = 1.0
+# LEF macro names; halo applies only when node_to_macro_name matches (case-insensitive).
+DEFAULT_SMALL_MACRO_HALO_MACRO_NAMES = frozenset(
+    {"Mux16", "And16", "Not16", "Or16", "BitAnd16", "BitOr16", "BitXor16", "Eq16", "Gt16", "GtE16", "Lt16", "LtE16", "NotEq16", "Register16", "Add16", "LShift16", "RShift16", "Sub16"}
+)
+## Inset applied to core on all sides for the root placement region (reduces FP / snap pushing past core).
+DEFAULT_PLACEMENT_INSET_UM = 5.0
+## When die_area is supplied, macro LEF bbox is clamped inside die minus this margin (per side).
+DEFAULT_DIE_INNER_MARGIN_UM = 2.0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -112,17 +124,39 @@ class HierarchicalPlacer:
         Recursion threshold.  Groups with <= N macros are solved by
         exhaustive permutation enumeration.
     D : int
-        Number of groups for clustering and number of slots for
-        enumeration.
+        Number of child groups at every recursive split (always merged down
+        to exactly ``min(D, len(nodes))`` clusters). Also used as the number
+        of slot columns in the enumeration grid (rows are sized to fit all nodes).
+    cluster_area_balance_weight : float
+        Multiplier on the squared area overshoot penalty in each merge decision
+        (``edge_count - weight * penalty``). **Larger** values push partitions toward
+        similar total macro area per cluster, at the cost of sometimes merging fewer
+        highly connected neighbors. **Smaller** values keep connectivity primary so
+        tightly coupled macros merge even when that yields uneven cluster areas.
     min_aspect_ratio : float
         Minimum allowed aspect ratio (height / width) for sub-regions.
     max_aspect_ratio : float
         Maximum allowed aspect ratio (height / width) for sub-regions.
     macro_gap : float
         Minimum gap between placed macros (microns).
+    max_small_macro_halo : float
+        Per-side halo in microns for whitelisted macro names only.
+    small_macro_halo_macro_names : Optional[Set[str]]
+        Only these LEF macro names receive the halo (compared case-insensitively).
+        None uses DEFAULT_SMALL_MACRO_HALO_MACRO_NAMES.
     manufacturing_grid : float
         Manufacturing grid for snapping coordinates (microns).
         Defaults to 0.005 (FreePDK45).
+    die_area : tuple (x_min, y_min, x_max, y_max) | None
+        Optional die rectangle in microns (same convention as DEF DIEAREA). When set,
+        each macro's LEF bbox is clamped inside the die after placement so global
+        routing does not see pins outside the die. OpenROAD die is typically larger
+        than core; passing this matches GRT's boundary check.
+    placement_inset_um : float
+        Shrinks the **core** rectangle on all sides before the top-level recursive
+        place (only affects the root region; sub-regions stay inside it).
+    die_inner_margin_um : float
+        Extra inset from die edges when applying die clamping.
     """
 
     def __init__(
@@ -133,26 +167,51 @@ class HierarchicalPlacer:
         core_area: Tuple[float, float, float, float],
         N: int = DEFAULT_N,
         D: int = DEFAULT_D,
+        cluster_area_balance_weight: float = DEFAULT_CLUSTER_AREA_BALANCE_WEIGHT,
         min_aspect_ratio: float = DEFAULT_MIN_ASPECT_RATIO,
         max_aspect_ratio: float = DEFAULT_MAX_ASPECT_RATIO,
         macro_gap: float = DEFAULT_MACRO_GAP,
         enable_small_macro_halo: bool = DEFAULT_ENABLE_SMALL_MACRO_HALO,
         max_small_macro_halo: float = DEFAULT_MAX_SMALL_MACRO_HALO,
-        small_macro_halo_median_factor: float = DEFAULT_SMALL_MACRO_HALO_MEDIAN_FACTOR,
+        small_macro_halo_macro_names: Optional[Set[str]] = None,
+        die_area: Optional[Tuple[float, float, float, float]] = None,
+        placement_inset_um: float = DEFAULT_PLACEMENT_INSET_UM,
+        die_inner_margin_um: float = DEFAULT_DIE_INNER_MARGIN_UM,
         manufacturing_grid: float = 0.005,
     ):
         self.graph = graph
         self.macro_size_dict = macro_size_dict
         self.node_to_macro_name = node_to_macro_name
         self.core_region = Region(*core_area)
+        self.die_inner_margin_um = die_inner_margin_um
+        self._die_region: Optional[Region] = Region(*die_area) if die_area is not None else None
+
+        inset = placement_inset_um
+        cr = self.core_region
+        self._floorplan_region = Region(
+            cr.x_min + inset, cr.y_min + inset, cr.x_max - inset, cr.y_max - inset
+        )
+        if self._floorplan_region.width <= 0.0 or self._floorplan_region.height <= 0.0:
+            debug_print(
+                f"placement_inset_um={inset} leaves non-positive floorplan region; using core as-is."
+            )
+            self._floorplan_region = cr
         self.N = N
         self.D = D
+        self.cluster_area_balance_weight = cluster_area_balance_weight
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
         self.macro_gap = macro_gap
         self.enable_small_macro_halo = enable_small_macro_halo
         self.max_small_macro_halo = max_small_macro_halo
-        self.small_macro_halo_median_factor = small_macro_halo_median_factor
+        names = (
+            small_macro_halo_macro_names
+            if small_macro_halo_macro_names is not None
+            else DEFAULT_SMALL_MACRO_HALO_MACRO_NAMES
+        )
+        self._small_macro_halo_macro_names_upper = frozenset(
+            n.upper() for n in names
+        )
         self.manufacturing_grid = manufacturing_grid
 
         # Pre-compute node areas for fast lookup
@@ -174,12 +233,6 @@ class HierarchicalPlacer:
             else:
                 self._node_size[node] = (0.0, 0.0)
 
-        nonzero_areas = sorted(a for a in self._node_area.values() if a > 0.0)
-        if nonzero_areas:
-            self._median_macro_area = nonzero_areas[len(nonzero_areas) // 2]
-        else:
-            self._median_macro_area = 0.0
-
     # ──────────────────────────────────────────────────────────
     #  Public API
     # ──────────────────────────────────────────────────────────
@@ -199,13 +252,27 @@ class HierarchicalPlacer:
             debug_print("No macros to place.")
             return {}
 
-        debug_print(f"Placing {len(nodes)} macros in region {self.core_region}")
-        positions = self._place_recursive(nodes, self.core_region, depth=0)
+        debug_print(
+            f"Placing {len(nodes)} macros: core={self.core_region}, "
+            f"floorplan={self._floorplan_region}, die={self._die_region}"
+        )
+        positions = self._place_recursive(nodes, self._floorplan_region, depth=0)
 
-        # Snap to manufacturing grid
-        snapped = {}
+        snapped: Dict[str, Tuple[float, float]] = {}
         for node, (x, y) in positions.items():
-            snapped[node] = (self._snap(x), self._snap(y))
+            x, y = self._snap(x), self._snap(y)
+            w, h = self._node_size[node]
+            x, y = self._clamp_macro_bbox_ll(
+                x, y, w, h, self._floorplan_region.x_min, self._floorplan_region.y_min,
+                self._floorplan_region.x_max, self._floorplan_region.y_max,
+            )
+            if self._die_region is not None:
+                m = self.die_inner_margin_um
+                dr = self._die_region
+                x, y = self._clamp_macro_bbox_ll(
+                    x, y, w, h, dr.x_min + m, dr.y_min + m, dr.x_max - m, dr.y_max - m,
+                )
+            snapped[node] = (x, y)
 
         debug_print(f"Placement complete. {len(snapped)} macros placed.")
         return snapped
@@ -378,7 +445,8 @@ class HierarchicalPlacer:
         Returns a list of (x, y, width, height) tuples for each slot.
         """
         n = len(nodes)
-        cols = max(1, math.ceil(math.sqrt(n)))
+        # Prefer a fixed column count of D (same fan-out as recursive clustering), not sqrt(n).
+        cols = max(1, min(self.D, n))
         rows = max(1, math.ceil(n / cols))
 
         slot_w = region.width / cols
@@ -404,14 +472,19 @@ class HierarchicalPlacer:
         depth: int,
     ) -> Dict[str, Tuple[float, float]]:
         """
-        Cluster nodes into D groups by connectivity, allocate
-        sub-regions proportional to group area, and recurse.
+        Cluster nodes into exactly D_eff groups (D_eff = min(self.D, len(nodes))) using
+        connectivity and area balance, allocate area-proportional strips (orientation
+        alternates with depth: horizontal strips at even depth, vertical at odd), then recurse.
         """
         indent = "  " * depth
-        D = min(self.D, len(nodes))
+        D_eff = min(self.D, len(nodes))
 
-        groups = self._greedy_connectivity_cluster(nodes, D)
-        debug_print(f"{indent}Clustered {len(nodes)} nodes into {len(groups)} groups: {[len(g) for g in groups]}")
+        groups = self._area_aware_connectivity_cluster(nodes, D_eff)
+        assert len(groups) == D_eff, f"expected {D_eff} groups, got {len(groups)}"
+        debug_print(
+            f"{indent}Clustered {len(nodes)} nodes into {len(groups)} groups (D={self.D}): "
+            f"{[len(g) for g in groups]}, areas={[round(sum(self._node_effective_area(n) for n in g), 2) for g in groups]}"
+        )
 
         # Compute total area per group
         group_areas = []
@@ -419,7 +492,7 @@ class HierarchicalPlacer:
             total = sum(self._node_effective_area(n) for n in group)
             group_areas.append(max(total, 1e-6))  # avoid zero
 
-        # Allocate sub-regions using slicing: alternate horizontal/vertical cuts
+        # Allocate sub-regions as strips; orientation alternates by recursion depth
         sub_regions = self._allocate_sub_regions(group_areas, region, depth)
 
         # Recurse on each group
@@ -430,33 +503,37 @@ class HierarchicalPlacer:
 
         return positions
 
-    def _greedy_connectivity_cluster(
+    def _area_aware_connectivity_cluster(
         self,
         nodes: List[str],
         D: int,
     ) -> List[Set[str]]:
         """
-        Greedy agglomerative clustering based on edge connectivity.
+        Agglomerative clustering until exactly D clusters remain.
 
-        Start with each node in its own cluster, then repeatedly merge
-        the two most-connected clusters until D clusters remain.
-        Connectivity weight = number of edges between clusters in the
-        original graph (reflects bus width / data flow).
+        Each merge scores connectivity (inter-cluster edge count) minus a
+        quadratic penalty when merged effective area exceeds total/D, so
+        partitions stay closer to equal macro area while preserving dataflow.
+
+        Always performs len(nodes) - D merges (unlike a pure connectivity heap,
+        which can stop early on sparse graphs and leave more than D clusters).
         """
         node_set = set(nodes)
 
-        # Initialize: each node is its own cluster
-        # cluster_id -> set of nodes
         clusters: Dict[int, Set[str]] = {}
         node_to_cluster: Dict[str, int] = {}
         for i, node in enumerate(nodes):
             clusters[i] = {node}
             node_to_cluster[node] = i
 
-        # Build initial inter-cluster connectivity
-        # (cluster_a, cluster_b) -> weight
-        connectivity: Dict[Tuple[int, int], int] = {}
+        cluster_area: Dict[int, float] = {
+            cid: sum(self._node_effective_area(n) for n in group)
+            for cid, group in clusters.items()
+        }
+        total_area = sum(cluster_area.values())
+        target = total_area / max(D, 1)
 
+        connectivity: Dict[Tuple[int, int], int] = {}
         for u, v in self.graph.edges():
             if u not in node_set or v not in node_set:
                 continue
@@ -467,53 +544,66 @@ class HierarchicalPlacer:
             key = (min(cu, cv), max(cu, cv))
             connectivity[key] = connectivity.get(key, 0) + 1
 
-        # Use a max-heap (negate weights) for efficient merging
-        heap = [(-w, a, b) for (a, b), w in connectivity.items()]
-        heapq.heapify(heap)
+        def merge_score(ca: int, cb: int) -> float:
+            # See DEFAULT_CLUSTER_AREA_BALANCE_WEIGHT comment: higher weight -> stronger area balance.
+            conn_w = connectivity.get((min(ca, cb), max(ca, cb)), 0)
+            merged_area = cluster_area[ca] + cluster_area[cb]
+            over = max(0.0, merged_area - target)
+            penalty = (over / max(target, 1e-9)) ** 2
+            return float(conn_w) - self.cluster_area_balance_weight * penalty
 
-        while len(clusters) > D and heap:
-            neg_w, ca, cb = heapq.heappop(heap)
+        def pick_best_pair() -> Tuple[int, int]:
+            ids = sorted(clusters.keys())
+            best_pair: Optional[Tuple[int, int]] = None
+            best_key: Optional[Tuple[float, int, float, float]] = None
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    ca, cb = ids[i], ids[j]
+                    conn_w = connectivity.get((min(ca, cb), max(ca, cb)), 0)
+                    sc = merge_score(ca, cb)
+                    merged_area = cluster_area[ca] + cluster_area[cb]
+                    mx = max(cluster_area[ca], cluster_area[cb])
+                    err = abs(merged_area - target)
+                    key = (sc, conn_w, -mx, -err)
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_pair = (ca, cb)
+            assert best_pair is not None
+            return best_pair
 
-            # Skip if either cluster was already merged
-            if ca not in clusters or cb not in clusters:
-                continue
+        while len(clusters) > D:
+            ca, cb = pick_best_pair()
 
-            # Merge cb into ca
             for node in clusters[cb]:
                 node_to_cluster[node] = ca
             clusters[ca] = clusters[ca] | clusters[cb]
             del clusters[cb]
+            cluster_area[ca] = cluster_area[ca] + cluster_area[cb]
+            del cluster_area[cb]
 
-            # Recompute connectivity for the merged cluster ca
-            # against all remaining clusters
             new_conn: Dict[int, int] = {}
             for (a, b), w in list(connectivity.items()):
-                # Remove old entries involving ca or cb
                 if a == cb or b == cb or a == ca or b == ca:
-                    # Determine the "other" cluster
                     other = None
                     if a == ca or a == cb:
                         other = b
                     else:
                         other = a
                     if other == ca or other == cb:
-                        continue  # self-edge after merge
+                        continue
                     if other not in clusters:
                         continue
                     new_conn[other] = new_conn.get(other, 0) + w
 
-            # Remove old connectivity entries involving ca or cb
             connectivity = {
                 (a, b): w
                 for (a, b), w in connectivity.items()
                 if a != ca and a != cb and b != ca and b != cb
             }
 
-            # Add new entries for merged cluster
             for other, w in new_conn.items():
                 key = (min(ca, other), max(ca, other))
                 connectivity[key] = connectivity.get(key, 0) + w
-                heapq.heappush(heap, (-connectivity[key], key[0], key[1]))
 
         return list(clusters.values())
 
@@ -524,62 +614,85 @@ class HierarchicalPlacer:
         depth: int,
     ) -> List[Region]:
         """
-        Allocate sub-regions within the given region proportional to
-        group areas.  Uses a simple slicing approach: at even depths,
-        slice horizontally (split width); at odd depths, slice vertically
-        (split height).
+        Allocate sub-regions as strips whose widths (or heights) are proportional
+        to group macro area.
+
+        Strip orientation alternates with recursion depth (``_place_recursive`` /
+        ``_cluster_and_recurse`` depth): **even** depth uses **horizontal** strips
+        (stacked rows, full parent width — implemented as ``_slice_vertical``),
+        **odd** depth uses **vertical** strips (side-by-side columns, full parent
+        height — ``_slice_horizontal``).
+
+        Each slice's rectangle area is proportional to the sum of effective macro
+        areas in that cluster (``sum(_node_effective_area)`` for nodes in the group).
         """
-        total_area = sum(group_areas)
         n = len(group_areas)
 
         if n == 1:
             return [region]
 
-        # Decide slicing direction based on region shape and depth
-        # Prefer cutting the longer dimension
-        if region.width >= region.height:
-            # Slice along x (vertical cuts → side-by-side sub-regions)
-            return self._slice_horizontal(group_areas, region, total_area)
-        else:
-            # Slice along y (horizontal cuts → stacked sub-regions)
-            return self._slice_vertical(group_areas, region, total_area)
+        # depth 0 = top-level partition after initial clustering
+        if depth % 2 == 0:
+            return self._slice_vertical(group_areas, region)
+        return self._slice_horizontal(group_areas, region)
 
     def _slice_horizontal(
         self,
         group_areas: List[float],
         region: Region,
-        total_area: float,
     ) -> List[Region]:
-        """Split region into vertical strips proportional to group areas."""
-        sub_regions = []
-        x_cursor = region.x_min
-        for i, area in enumerate(group_areas):
-            fraction = area / total_area
-            strip_width = region.width * fraction
-            sub_regions.append(Region(
-                x_cursor, region.y_min,
-                x_cursor + strip_width, region.y_max
-            ))
-            x_cursor += strip_width
+        """
+        Vertical strips (columns): each slice spans the full parent height, slice
+        width is ``region.width * (macro_area_i / sum(macro_areas))``. Slice
+        geometric area is therefore ``region.area * macro_area_i / sum(...)`` —
+        proportional to the macro area budget for that group.
+        """
+        T = sum(group_areas)
+        if T <= 0.0:
+            T = 1e-9
+        W = region.width
+        H = region.height
+        x0 = region.x_min
+        y0, y1 = region.y_min, region.y_max
+        x1_bound = region.x_max
+        sub_regions: List[Region] = []
+        n = len(group_areas)
+        for i, a in enumerate(group_areas):
+            if i == n - 1:
+                x1 = x1_bound
+            else:
+                x1 = x0 + W * (a / T)
+            sub_regions.append(Region(x0, y0, x1, y1))
+            x0 = x1
         return sub_regions
 
     def _slice_vertical(
         self,
         group_areas: List[float],
         region: Region,
-        total_area: float,
     ) -> List[Region]:
-        """Split region into horizontal strips proportional to group areas."""
-        sub_regions = []
-        y_cursor = region.y_min
-        for i, area in enumerate(group_areas):
-            fraction = area / total_area
-            strip_height = region.height * fraction
-            sub_regions.append(Region(
-                region.x_min, y_cursor,
-                region.x_max, y_cursor + strip_height
-            ))
-            y_cursor += strip_height
+        """
+        Horizontal strips (rows): each slice spans the full parent width, slice
+        height is ``region.height * (macro_area_i / sum(macro_areas))``. Slice
+        geometric area is ``region.area * macro_area_i / sum(...)``.
+        """
+        T = sum(group_areas)
+        if T <= 0.0:
+            T = 1e-9
+        W = region.width
+        H = region.height
+        x0, x1 = region.x_min, region.x_max
+        y0 = region.y_min
+        y1_bound = region.y_max
+        sub_regions: List[Region] = []
+        n = len(group_areas)
+        for i, a in enumerate(group_areas):
+            if i == n - 1:
+                y1 = y1_bound
+            else:
+                y1 = y0 + H * (a / T)
+            sub_regions.append(Region(x0, y0, x1, y1))
+            y0 = y1
         return sub_regions
 
     # ──────────────────────────────────────────────────────────
@@ -672,11 +785,53 @@ class HierarchicalPlacer:
             x_cursor += ew + self.macro_gap
             row_max_h = max(row_max_h, h + 2.0 * halo)
 
+        # Row packing does not prove y extent fits; clamp LL so LEF bbox stays in region.
+        for node in list(positions):
+            w, h = self._node_size[node]
+            x, y = positions[node]
+            nx, ny = self._clamp_macro_bbox_ll(
+                x, y, w, h,
+                region.x_min, region.y_min, region.x_max, region.y_max,
+            )
+            if (nx, ny) != (x, y):
+                debug_print(
+                    f"_pack_in_rows: clamped {node} from ({x:.3f},{y:.3f}) to ({nx:.3f},{ny:.3f}) "
+                    f"to fit {region}"
+                )
+            positions[node] = (nx, ny)
+
         return positions
 
     # ──────────────────────────────────────────────────────────
     #  Utilities
     # ──────────────────────────────────────────────────────────
+
+    def _clamp_macro_bbox_ll(
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        xmin: float,
+        ymin: float,
+        xmax: float,
+        ymax: float,
+    ) -> Tuple[float, float]:
+        """
+        Clamp macro lower-left so the LEF SIZE box [x,x+w]×[y,y+h] lies in
+        [xmin,xmax]×[ymin,ymax] (x/y are edges; macro must satisfy x+w<=xmax, y+h<=ymax).
+        """
+        if w <= 0.0 or h <= 0.0:
+            return x, y
+        if xmax - xmin < w - 1e-9 or ymax - ymin < h - 1e-9:
+            debug_print(
+                f"_clamp_macro_bbox_ll: macro {w}x{h} um does not fit in "
+                f"({xmin},{ymin})-({xmax},{ymax}); pinning LL to corner."
+            )
+            return xmin, ymin
+        x = max(xmin, min(x, xmax - w))
+        y = max(ymin, min(y, ymax - h))
+        return x, y
 
     def _snap(self, value: float) -> float:
         """Snap a value to the manufacturing grid."""
@@ -685,24 +840,16 @@ class HierarchicalPlacer:
         return round(value / self.manufacturing_grid) * self.manufacturing_grid
 
     def _small_macro_halo(self, node: str) -> float:
-        """
-        Dynamic per-side halo around smaller macros.
-        Macros at/above median area get no extra halo.
-        """
+        """Fixed per-side halo for whitelisted LEF macro names only."""
         if not self.enable_small_macro_halo:
             return 0.0
-        area = self._node_area.get(node, 0.0)
-        if area <= 0.0 or self._median_macro_area <= 0.0:
+        macro_name = self.node_to_macro_name.get(node)
+        if not macro_name or macro_name.upper() not in self._small_macro_halo_macro_names_upper:
             return 0.0
-        threshold = self._median_macro_area * self.small_macro_halo_median_factor
-        if area >= threshold:
-            return 0.0
-        ratio = (threshold / area) - 1.0
-        halo = self.macro_gap * ratio
-        return max(0.0, min(halo, self.max_small_macro_halo))
+        return max(0.0, self.max_small_macro_halo)
 
     def _node_effective_area(self, node: str) -> float:
-        """Area including dynamic halo, used for region allocation."""
+        """Area including name-based halo, used for region allocation."""
         w, h = self._node_size.get(node, (0.0, 0.0))
         halo = self._small_macro_halo(node)
         return (w + 2.0 * halo) * (h + 2.0 * halo)
